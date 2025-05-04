@@ -56,60 +56,41 @@ class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # Initial projection from 768 to 512 channels
-        self.initial_conv = nn.Conv2d(768, 512, 1)
-
-        # Upsampling blocks
         self.decoder = nn.Sequential(
-            # 16x16 -> 28x28
-            nn.ConvTranspose2d(512, 256, kernel_size=3, stride=2, padding=3, output_padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(256),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(256),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(256),
+            # Initial projection
+            nn.Conv2d(768, 256, kernel_size=1),
 
-            # 28x28 -> 56x56
-            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.ReLU(),
+            # Block 1: 16x16 -> 28x28
+            nn.Upsample(size=(28, 28), mode='bilinear', align_corners=False),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.BatchNorm2d(128),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(128),
 
-            # 56x56 -> 112x112
-            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.ReLU(),
+            # Block 2: 28x28 -> 56x56
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
-            nn.Conv2d(64, 64, kernel_size=1), # Refinement/Attention-like block
             nn.ReLU(),
-            nn.BatchNorm2d(64),
 
-            # 112x112 -> 224x224
-            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.ReLU(),
+            # Block 3: 56x56 -> 112x112
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
-            nn.Conv2d(32, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.BatchNorm2d(32),
-            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+
+            # Block 4: 112x112 -> 224x224
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
             nn.ReLU(),
-            nn.BatchNorm2d(32),
 
             # Final convolution to get 3 channels (RGB)
-            nn.Conv2d(32, 3, kernel_size=3, padding=1),
+            nn.Conv2d(16, 3, kernel_size=1),
             nn.Sigmoid()  # Ensure output is in [0,1] range for images
         )
 
     def forward(self, x):
         # x shape: (B, 768, 16, 16)
-        x = self.initial_conv(x)
         x = self.decoder(x)
         # x shape: (B, 3, 224, 224)
         return x
