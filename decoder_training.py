@@ -52,24 +52,37 @@ def get_dinov2_latents(image_paths, processor, model, device, batch_size=32):
 
 # --- Decoder Model ---
 
+class LinearWithSkip(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        self.linear = nn.Conv2d(num_features, num_features, kernel_size=1)
+
+    def forward(self, x):
+        return self.linear(x) + x
+
+
 class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
 
         self.decoder = nn.Sequential(
             # Initial projection
-            nn.Conv2d(768, 256, kernel_size=1),
+            nn.Conv2d(768, 420, kernel_size=1),
 
             # Block 1: 16x16 -> 28x28
             nn.Upsample(size=(28, 28), mode='bilinear', align_corners=False),
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(420, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            LinearWithSkip(256),
             nn.ReLU(),
 
             # Block 2: 28x28 -> 56x56
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.Conv2d(256, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
+            nn.ReLU(),
+            LinearWithSkip(64),
             nn.ReLU(),
 
             # Block 3: 56x56 -> 112x112
@@ -77,11 +90,15 @@ class Decoder(nn.Module):
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
+            LinearWithSkip(32),
+            nn.ReLU(),
 
             # Block 4: 112x112 -> 224x224
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.Conv2d(32, 16, kernel_size=3, padding=1),
             nn.BatchNorm2d(16),
+            nn.ReLU(),
+            LinearWithSkip(16),
             nn.ReLU(),
 
             # Final convolution to get 3 channels (RGB)
@@ -136,6 +153,7 @@ def train_decoder(args):
         print("No images found. Exiting.")
         return
 
+    # Load cached latents if available
     if args.cache_latents and Path(args.cache_dir).exists():
         dinov2_latents = torch.load(Path(args.cache_dir) / 'dinov2_latents.pt')
         if len(dinov2_latents) != len(image_paths):
@@ -180,13 +198,13 @@ def train_decoder(args):
     fixed_target_images_batch = fixed_target_images_batch.to(device)
 
     # Initialize Decoder model
-    decoder = Decoder().to(device)
+    decoder = torch.compile(Decoder().to(device))
 
     # Watch model parameters and gradients with wandb
     wandb.watch(decoder, log='all', log_freq=100) # Log gradients every 100 batches
 
     # Loss and optimizer
-    criterion = nn.MSELoss()
+    criterion = nn.L1Loss()
     optimizer = optim.Adam(decoder.parameters(), lr=args.learning_rate)
 
     # Training loop
@@ -232,6 +250,10 @@ def train_decoder(args):
                 output_images = decoder(fixed_latents_batch)
             decoder.train() # Set model back to train mode
 
+            # Calculate additional metrics for the fixed batch
+            mse_loss = nn.MSELoss()(output_images, fixed_target_images_batch)
+            psnr = -10 * torch.log10(mse_loss)
+
             # Prepare images for logging (log first 8 images from the fixed batch)
             log_images = []
             num_samples_to_log = min(4, args.batch_size)
@@ -241,7 +263,12 @@ def train_decoder(args):
                 log_images.append(wandb.Image(original, caption=f"Epoch {epoch+1} - Original {j}"))
                 log_images.append(wandb.Image(reconstructed, caption=f"Epoch {epoch+1} - Reconstructed {j}"))
 
-            wandb.log({"epoch": epoch + 1, "sample_reconstructions": log_images})
+            wandb.log({
+                "epoch": epoch + 1,
+                "sample_reconstructions": log_images,
+                "validation_mse": mse_loss.item(),
+                "validation_psnr": psnr.item(),
+            }, step=(epoch+1) * len(dataloader))
 
         print('Finished Training')
     except KeyboardInterrupt:
@@ -270,8 +297,8 @@ if __name__ == "__main__":
     parser.add_argument("--cache-latents", action=argparse.BooleanOptionalAction, default=True, help="Cache DINOv2 latents (default: True). Use --no-cache-latents to disable.")
     parser.add_argument("--cache_dir", type=str, default='dinov2_latents', help="Directory to cache DINOv2 latents.")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training and latent extraction.")
-    parser.add_argument("--epochs", type=int, default=42, help="Number of training epochs.")
-    parser.add_argument("--learning_rate", type=float, default=0.001, help="Learning rate for the optimizer.")
+    parser.add_argument("--epochs", type=int, default=60, help="Number of training epochs.")
+    parser.add_argument("--learning_rate", type=float, default=0.002, help="Learning rate for the optimizer.")
     parser.add_argument("--num_workers", type=int, default=2, help="Number of workers for the DataLoader.")
     parser.add_argument("--output_model_path", type=str, default="decoder_model.pth", help="Path to save the trained decoder model.")
 
