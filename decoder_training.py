@@ -52,13 +52,17 @@ def get_dinov2_latents(image_paths, processor, model, device, batch_size=32):
 
 # --- Decoder Model ---
 
-class LinearWithSkip(nn.Module):
+class ConvWithSkip(nn.Module):
     def __init__(self, num_features):
         super().__init__()
-        self.linear = nn.Conv2d(num_features, num_features, kernel_size=1)
+        self.nn = nn.Sequential(
+            nn.Conv2d(num_features, num_features, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(num_features, num_features, kernel_size=1),
+        )
 
     def forward(self, x):
-        return self.linear(x) + x
+        return self.nn(x) + x
 
 
 class Decoder(nn.Module):
@@ -67,42 +71,34 @@ class Decoder(nn.Module):
 
         self.decoder = nn.Sequential(
             # Initial projection
-            nn.Conv2d(768, 420, kernel_size=1),
+            nn.Conv2d(768, 512, kernel_size=1),
 
             # Block 1: 16x16 -> 28x28
-            nn.Upsample(size=(28, 28), mode='bilinear', align_corners=False),
-            nn.Conv2d(420, 256, kernel_size=3, padding=1),
+            nn.ConvTranspose2d(512, 256, kernel_size=3, stride=2, padding=3, output_padding=1),
             nn.BatchNorm2d(256),
-            nn.ReLU(),
-            LinearWithSkip(256),
-            nn.ReLU(),
+            nn.GELU(),
+            ConvWithSkip(256),
 
             # Block 2: 28x28 -> 56x56
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(256, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            LinearWithSkip(64),
-            nn.ReLU(),
+            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+            ConvWithSkip(128),
 
             # Block 3: 56x56 -> 112x112
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            LinearWithSkip(32),
-            nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            ConvWithSkip(64),
 
             # Block 4: 112x112 -> 224x224
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(32, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            LinearWithSkip(16),
-            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            ConvWithSkip(32),
 
             # Final convolution to get 3 channels (RGB)
-            nn.Conv2d(16, 3, kernel_size=1),
+            nn.Conv2d(32, 3, kernel_size=1),
             nn.Sigmoid()  # Ensure output is in [0,1] range for images
         )
 
@@ -232,7 +228,9 @@ def train_decoder(args):
                 optimizer.step()
 
                 # Log loss to wandb
-                wandb.log({"batch_loss": loss.item()}, step=epoch * len(dataloader) + i)
+                l2_loss = nn.MSELoss()(output_images, target_images_batch)
+                psnr = -10 * torch.log10(l2_loss)
+                wandb.log({"l1_loss": loss.item(), "l2_loss": l2_loss.item(), "psnr": psnr.item()})
 
                 running_loss += loss.item()
 
@@ -240,8 +238,6 @@ def train_decoder(args):
                 if i % 10 == 9: # Log every 10 batches
                     avg_loss = running_loss / 10
                     progress_bar.set_postfix({'loss': f'{avg_loss:.4f}'})
-                    # Log average loss for the last 10 batches
-                    wandb.log({"avg_batch_loss": avg_loss}, step=epoch * len(dataloader) + i)
                     running_loss = 0.0
 
             # Log sample reconstructions at the end of each epoch
@@ -249,10 +245,6 @@ def train_decoder(args):
             with torch.no_grad():
                 output_images = decoder(fixed_latents_batch)
             decoder.train() # Set model back to train mode
-
-            # Calculate additional metrics for the fixed batch
-            mse_loss = nn.MSELoss()(output_images, fixed_target_images_batch)
-            psnr = -10 * torch.log10(mse_loss)
 
             # Prepare images for logging (log first 8 images from the fixed batch)
             log_images = []
@@ -266,8 +258,6 @@ def train_decoder(args):
             wandb.log({
                 "epoch": epoch + 1,
                 "sample_reconstructions": log_images,
-                "validation_mse": mse_loss.item(),
-                "validation_psnr": psnr.item(),
             }, step=(epoch+1) * len(dataloader))
 
         print('Finished Training')
