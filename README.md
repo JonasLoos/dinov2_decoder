@@ -5,12 +5,18 @@ This project trains a convolutional decoder model to reconstruct images from the
 
 ## Prepare Dataset
 
-Run `python download_unsplash.py` to download a subset of the [Unsplash Lite](https://github.com/unsplash/datasets?tab=readme-ov-file#lite-dataset) dataset and generate `224x224` cropped training images. The images will be saved in `unsplash_lite_image_dataset/training_images/`.
+```bash
+python download_unsplash.py
+```
+
+This will download a subset of the [Unsplash Lite](https://github.com/unsplash/datasets?tab=readme-ov-file#lite-dataset) dataset and generate `224x224` cropped training images. The images will be saved in `unsplash_lite_image_dataset/training_images/`.
 
 
 ## Train Decoder
 
-Run `python decoder_training.py --image_dir unsplash_lite_image_dataset/training_images/`.
+```bash
+python decoder_training.py --image_dir unsplash_lite_image_dataset/training_images/
+```
 
 This script will:
 

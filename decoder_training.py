@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 import argparse
+import wandb
 
 
 # --- DINOv2 Feature Extraction ---
@@ -137,6 +138,14 @@ def train_decoder(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # Initialize wandb
+    wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_name,
+        config=args
+    )
+
     # List images
     print(f"Scanning for images in {args.image_dir}...")
     image_paths = list(Path(args.image_dir).glob('*.jpg'))
@@ -175,8 +184,25 @@ def train_decoder(args):
         pin_memory=True if device == torch.device("cuda") else False
     )
 
+    # Create a non-shuffled dataloader for deterministic visualization batch
+    vis_dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False, # Ensure deterministic batch selection
+        num_workers=args.num_workers,
+        pin_memory=True if device == torch.device("cuda") else False
+    )
+
+    # Get a fixed batch for visualization
+    fixed_latents_batch, fixed_target_images_batch = next(iter(vis_dataloader))
+    fixed_latents_batch = fixed_latents_batch.to(device)
+    fixed_target_images_batch = fixed_target_images_batch.to(device)
+
     # Initialize Decoder model
     decoder = Decoder().to(device)
+
+    # Watch model parameters and gradients with wandb
+    wandb.watch(decoder, log='all', log_freq=100) # Log gradients every 100 batches
 
     # Loss and optimizer
     criterion = nn.MSELoss()
@@ -206,12 +232,35 @@ def train_decoder(args):
                 loss.backward()
                 optimizer.step()
 
+                # Log loss to wandb
+                wandb.log({"batch_loss": loss.item()}, step=epoch * len(dataloader) + i)
+
                 running_loss += loss.item()
 
                 # Update progress bar
                 if i % 10 == 9: # Log every 10 batches
-                    progress_bar.set_postfix({'loss': f'{running_loss / 10:.4f}'})
+                    avg_loss = running_loss / 10
+                    progress_bar.set_postfix({'loss': f'{avg_loss:.4f}'})
+                    # Log average loss for the last 10 batches
+                    wandb.log({"avg_batch_loss": avg_loss}, step=epoch * len(dataloader) + i)
                     running_loss = 0.0
+
+            # Log sample reconstructions at the end of each epoch
+            decoder.eval() # Set model to evaluation mode
+            with torch.no_grad():
+                output_images = decoder(fixed_latents_batch)
+            decoder.train() # Set model back to train mode
+
+            # Prepare images for logging (log first 8 images from the fixed batch)
+            log_images = []
+            num_samples_to_log = min(4, args.batch_size)
+            for j in range(num_samples_to_log):
+                original = fixed_target_images_batch[j].cpu().permute(1, 2, 0).numpy()
+                reconstructed = output_images[j].cpu().permute(1, 2, 0).numpy()
+                log_images.append(wandb.Image(original, caption=f"Epoch {epoch+1} - Original {j}"))
+                log_images.append(wandb.Image(reconstructed, caption=f"Epoch {epoch+1} - Reconstructed {j}"))
+
+            wandb.log({"epoch": epoch + 1, "sample_reconstructions": log_images})
 
         print('Finished Training')
     except KeyboardInterrupt:
@@ -225,6 +274,12 @@ def train_decoder(args):
             print(f"Saving model to {args.output_model_path}")
             torch.save(decoder.state_dict(), args.output_model_path)
             print("Model saved.")
+            model_artifact = wandb.Artifact(args.output_model_path, type="model")
+            model_artifact.add_file(args.output_model_path)
+            wandb.log_artifact(model_artifact)
+
+        # Finish wandb run
+        wandb.finish()
 
 
 if __name__ == "__main__":
@@ -234,10 +289,15 @@ if __name__ == "__main__":
     parser.add_argument("--cache-latents", action=argparse.BooleanOptionalAction, default=True, help="Cache DINOv2 latents (default: True). Use --no-cache-latents to disable.")
     parser.add_argument("--cache_dir", type=str, default='dinov2_latents', help="Directory to cache DINOv2 latents.")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training and latent extraction.")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
+    parser.add_argument("--epochs", type=int, default=42, help="Number of training epochs.")
     parser.add_argument("--learning_rate", type=float, default=0.001, help="Learning rate for the optimizer.")
     parser.add_argument("--num_workers", type=int, default=2, help="Number of workers for the DataLoader.")
     parser.add_argument("--output_model_path", type=str, default="decoder_model.pth", help="Path to save the trained decoder model.")
+
+    # Wandb arguments
+    parser.add_argument("--wandb_project", type=str, default="dinov2_decoder", help="Wandb project name.")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (username or team name).")
+    parser.add_argument("--wandb_name", type=str, default=None, help="Wandb run name.")
 
     args = parser.parse_args()
     train_decoder(args)
