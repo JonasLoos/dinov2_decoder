@@ -13,7 +13,6 @@ import wandb
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch.optim.swa_utils import AveragedModel
 import random
-import math # Added for Transformer Decoder
 
 
 # --- Reproducibility ---
@@ -71,276 +70,59 @@ def get_dinov2_latents(image_paths, processor, model, device, batch_size=32):
     return torch.cat(all_latents, dim=0).permute(0, 3, 1, 2)
 
 
-# --- Helper Modules for Transformer Decoder ---
+# --- Decoder Model ---
 
-class PositionalEncoding2D(nn.Module):
-    """Adds 2D Sinusoidal Positional Encoding to the input tensor."""
-    def __init__(self, d_model, height, width):
+class ConvWithSkip(nn.Module):
+    def __init__(self, num_features):
         super().__init__()
-        if d_model % 4 != 0:
-            raise ValueError(f"Cannot use sin/cos positional encoding with "
-                             f"even dimension (got d_model={d_model})") # Corrected error message
-        pe = torch.zeros(d_model, height, width)
-        # Each dimension uses half of d_model
-        d_model_half = d_model // 2
-        # Correct calculation for div_term based on standard implementations
-        div_term = torch.exp(torch.arange(0., d_model_half, 2) * -(math.log(10000.0) / (d_model_half - 2))) # Adjusted divisor
-        pos_w = torch.arange(0., width).unsqueeze(1)
-        pos_h = torch.arange(0., height).unsqueeze(1)
-        # Apply sin/cos to even/odd indices respectively
-        pe[0:d_model_half:2, :, :] = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
-        pe[1:d_model_half:2, :, :] = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
-        pe[d_model_half::2, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
-        pe[d_model_half+1::2, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
-        # Add batch dimension and register as buffer
-        self.register_buffer('pe', pe.unsqueeze(0), persistent=False) # Add persistent=False if not part of state_dict
+        self.nn = nn.Sequential(
+            nn.Conv2d(num_features, num_features, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(num_features, num_features, kernel_size=1),
+            nn.GELU(),
+        )
 
     def forward(self, x):
-        # x shape: [B, C, H, W]
-        # Add positional encoding, slicing pe if x has different H/W than initialized
-        # Ensure pe is on the same device as x
-        return x + self.pe[:, :, :x.size(2), :x.size(3)].to(x.device)
+        return self.nn(x) + x
 
-class TransformerDecoderBlock(nn.Module):
-    """Standard Transformer Encoder Block (Self-Attention + MLP)."""
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
+class Upsample2d(nn.Module):
+    def __init__(self, in_channels, out_channels, padding=1):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        # Implementation of Feedforward model
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-
-        self.activation = F.gelu # Using GELU which is common in Transformers
-
-    def forward(self, src):
-        # src shape: [B, SeqLen, Dim] (batch_first=True)
-        # Self-attention part with pre-normalization (common practice)
-        src_norm = self.norm1(src)
-        attn_output, _ = self.self_attn(src_norm, src_norm, src_norm) # Q=K=V for self-attention
-        src = src + self.dropout1(attn_output) # Residual connection
-        # Feedforward part with pre-normalization
-        src_norm = self.norm2(src)
-        ff_output = self.linear2(self.dropout(self.activation(self.linear1(src_norm))))
-        src = src + self.dropout2(ff_output) # Residual connection
-        return src
-
-class UpsampleBlock(nn.Module):
-    """Upsamples input, applies Conv, Norm (optional), and ReLU."""
-    def __init__(self, in_channels, out_channels, scale_factor=2, use_norm=True):
-        super().__init__()
-        # Use bilinear upsampling followed by convolution to avoid checkerboard artifacts
-        self.upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False)
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        # Use GroupNorm as an alternative to BatchNorm, often works well with Transformers
-        # Using 1 group makes it LayerNorm like across channels, using C groups makes it InstanceNorm like
-        num_groups = min(32, out_channels // 4) if out_channels >= 32 else out_channels # Heuristic for num_groups
-        self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=out_channels) if use_norm and out_channels > 0 else nn.Identity()
-        self.relu = nn.ReLU(inplace=True) # ReLU is fine, could also use GELU
+        self.conv = nn.Conv2d(in_channels, out_channels*4, kernel_size=3, padding=padding)
 
     def forward(self, x):
-        x = self.upsample(x)
-        x = x.contiguous() # Ensure contiguous memory layout after upsampling
         x = self.conv(x)
-        x = self.norm(x)
-        x = self.relu(x)
+        b, c, h, w = x.shape
+        x = x.reshape(b, c//4, 2, 2, h, w)
+        x = x.permute(0, 1, 4, 2, 5, 3)
+        x = x.reshape(b, c//4, h*2, w*2)
+        x = F.gelu(x)
         return x
 
 
-# --- Transformer-based Decoder ---
+Decoder = lambda: nn.Sequential(
+    # Initial projection
+    nn.Conv2d(768, 256, kernel_size=1),
 
-class TransformerPixelDecoder(nn.Module):
-    """
-    Decodes DINOv2 latents (patch embeddings) into an image using Transformer blocks
-    followed by a CNN upsampling path.
+    # Block 1: 16x16 -> 28x28
+    Upsample2d(256, 128, padding=0),
+    ConvWithSkip(128),
 
-    Args:
-        input_dim (int): Dimension of input DINOv2 features (e.g., 768).
-        hidden_dim (int): Internal dimension used by the Transformer and initial CNN layers.
-        nhead (int): Number of attention heads in Transformer blocks.
-        num_transformer_layers (int): Number of Transformer blocks.
-        dim_feedforward (int): Dimension of the feedforward network in Transformer blocks.
-        input_res (tuple): Spatial resolution of the input features (H, W), e.g., (16, 16).
-        output_res (tuple): Target spatial resolution of the output image (H, W), e.g., (224, 224).
-        use_norm_in_upsample (bool): Whether to use normalization (GroupNorm) in the upsampling blocks.
-    """
-    def __init__(self, input_dim=768, hidden_dim=384, nhead=6, num_transformer_layers=4,
-                 dim_feedforward=1536, input_res=(16, 16), output_res=(224, 224), use_norm_in_upsample=True):
-        super().__init__()
-        self.input_res = input_res
-        self.output_res = output_res
-        self.hidden_dim = hidden_dim
-        if hidden_dim % nhead != 0:
-             raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by nhead ({nhead})")
+    # Block 2: 28x28 -> 56x56
+    Upsample2d(128, 64),
+    ConvWithSkip(64),
 
-        # 1. Initial projection to hidden dimension (maintains spatial resolution)
-        self.proj_in = nn.Conv2d(input_dim, hidden_dim, kernel_size=1)
+    # Block 3: 56x56 -> 112x112
+    Upsample2d(64, 32),
+    ConvWithSkip(32),
 
-        # 2. Positional encoding for spatial information
-        self.pos_encoder = PositionalEncoding2D(hidden_dim, input_res[0], input_res[1])
+    # Block 4: 112x112 -> 224x224
+    Upsample2d(32, 16),
+    ConvWithSkip(16),
 
-        # 3. Transformer blocks to process patch embeddings
-        self.transformer_layers = nn.ModuleList([
-            TransformerDecoderBlock(hidden_dim, nhead, dim_feedforward)
-            for _ in range(num_transformer_layers)
-        ])
-
-        # 4. CNN Upsampling Path
-        # Calculate necessary upsampling stages. Target scale factor = output_res / input_res
-        target_scale_factor = output_res[0] / input_res[0]
-        num_upsample_layers = math.ceil(math.log2(target_scale_factor)) # Number of 2x upsampling stages needed
-
-        upsample_modules = []
-        current_dim = hidden_dim
-        # Progressively reduce channel dimension by halving, ensuring divisibility by 8 and minimum of 32
-        # ch_exp = np.linspace(np.log2(hidden_dim), np.log2(max(32, hidden_dim // (2**num_upsample_layers))), num_upsample_layers + 1)
-        # channel_dims = [int(2**exp) for exp in ch_exp]
-        channel_dims = [hidden_dim]
-        temp_current_dim = hidden_dim
-        for _ in range(num_upsample_layers):
-            next_dim = max(32, temp_current_dim // 2)
-            # Ensure divisibility by 8 for compatibility with GroupNorm heuristic, minimum 32
-            next_dim = max(32, (next_dim // 8) * 8 if next_dim >= 32 else next_dim)
-            channel_dims.append(next_dim)
-            temp_current_dim = next_dim
-
-        for i in range(num_upsample_layers):
-            in_ch = channel_dims[i]
-            out_ch = channel_dims[i+1]
-            upsample_modules.append(UpsampleBlock(in_ch, out_ch, scale_factor=2, use_norm=use_norm_in_upsample))
-            current_dim = out_ch
-
-        self.upsampling_cnn = nn.Sequential(*upsample_modules)
-
-        # 5. Final layer to match output resolution and channels
-        # Current resolution after num_upsample_layers of 2x scaling
-        current_res = input_res[0] * (2**num_upsample_layers)
-        # Add final interpolation if needed (e.g., if target 224 != 16 * 2^4 = 256)
-        self.needs_final_interp = current_res != output_res[0]
-        if self.needs_final_interp:
-            self.final_upsample = nn.Upsample(size=output_res, mode='bilinear', align_corners=False)
-            print(f"Decoder: Adding final interpolation from {current_res}x{current_res} to {output_res[0]}x{output_res[1]}")
-        else:
-            self.final_upsample = nn.Identity()
-
-        # Final 1x1 conv to get 3 channels (RGB)
-        self.final_conv = nn.Conv2d(current_dim, 3, kernel_size=1)
-        self.final_activation = nn.Sigmoid() # Output pixel values in [0, 1]
-
-
-    def forward(self, x):
-        # Input x: [B, input_dim, H, W], e.g., [B, 768, 16, 16] (DINOv2 patch embeddings)
-        B, C, H, W = x.shape
-        if H != self.input_res[0] or W != self.input_res[1]:
-             # Allow for slight variation if needed, or raise error
-             # For now, we'll resize the input if it doesn't match exactly.
-             # This might happen if a different DINO model is used.
-             print(f"Warning: Input spatial resolution mismatch. Expected {self.input_res}, got {(H, W)}. Resizing input.")
-             x = F.interpolate(x, size=self.input_res, mode='bilinear', align_corners=False)
-             B, C, H, W = x.shape # Update H, W after resize
-
-        # 1. Projection
-        x = self.proj_in(x) # [B, hidden_dim, H, W]
-
-        # 2. Add positional encoding
-        x_pos = self.pos_encoder(x) # [B, hidden_dim, H, W]
-
-        # 3. Flatten and run through Transformer blocks
-        # Flatten: [B, hidden_dim, H*W] -> Permute: [B, H*W, hidden_dim]
-        x_flat = x_pos.flatten(2).permute(0, 2, 1)
-        for layer in self.transformer_layers:
-            x_flat = layer(x_flat) # [B, H*W, hidden_dim]
-
-        # 4. Reshape back to image grid
-        # Permute: [B, hidden_dim, H*W] -> Reshape: [B, hidden_dim, H, W]
-        x_tf_out = x_flat.permute(0, 2, 1).reshape(B, self.hidden_dim, H, W).contiguous()
-
-        # 5. Upsample using CNN
-        x_up = self.upsampling_cnn(x_tf_out) # Output size depends on num_upsample_layers
-
-        # 6. Final layers
-        x_final = self.final_upsample(x_up) # Interpolate to target size if needed
-        x_final = self.final_conv(x_final) # [B, 3, output_res[0], output_res[1]]
-        output = self.final_activation(x_final) # [B, 3, output_res[0], output_res[1]]
-
-        return output
-
-# --- Original Decoder (commented out for reference) ---
-# class ConvWithSkip(nn.Module):
-#     def __init__(self, num_features):
-#         super().__init__()
-#         self.nn = nn.Sequential(
-#             nn.Conv2d(num_features, num_features, kernel_size=3, padding=1),
-#             nn.GELU(),
-#             nn.Conv2d(num_features, num_features, kernel_size=1),
-#             nn.GELU(),
-#         )
-#
-#     def forward(self, x):
-#         return self.nn(x) + x
-#
-# class Upsample2d(nn.Module):
-#     def __init__(self, in_channels, out_channels, padding=1):
-#         super().__init__()
-#         # Correct implementation: Conv first, then PixelShuffle (or TransposedConv)
-#         # This version used a Conv to increase channels then reshaped - like PixelShuffle
-#         # Let's keep it similar for now but note TransposedConv is another option
-#         self.conv = nn.Conv2d(in_channels, out_channels * 4, kernel_size=3, padding=padding)
-#         self.pixel_shuffle = nn.PixelShuffle(2) # Upscales H, W by factor of 2
-#
-#     def forward(self, x):
-#         x = self.conv(x) # [B, C_out*4, H, W]
-#         x = self.pixel_shuffle(x) # [B, C_out, H*2, W*2]
-#         x = F.gelu(x) # Apply activation *after* shuffle
-#         return x
-#
-# Decoder = lambda: nn.Sequential(
-#     # Initial projection
-#     nn.Conv2d(768, 256, kernel_size=1),
-#
-#     # Block 1: 16x16 -> 32x32 (Mistake in original comment: 16->28 not possible with std 2x upsample)
-#     # Assuming padding=1 was intended for Upsample2d to make it 32x32
-#     Upsample2d(256, 128, padding=1), # Output: 128 x 32 x 32
-#     ConvWithSkip(128),
-#
-#     # Block 2: 32x32 -> 64x64
-#     Upsample2d(128, 64, padding=1), # Output: 64 x 64 x 64
-#     ConvWithSkip(64),
-#
-#     # Block 3: 64x64 -> 128x128
-#     Upsample2d(64, 32, padding=1), # Output: 32 x 128 x 128
-#     ConvWithSkip(32),
-#
-#     # Block 4: 128x128 -> 256x256
-#     Upsample2d(32, 16, padding=1), # Output: 16 x 256 x 256
-#     ConvWithSkip(16),
-#
-#     # Final convolution needs adjustment if output is 256x256 and target is 224x224
-#     # Option 1: Add interpolation/cropping
-#     # Option 2: Adjust last Upsample2d or add a ConvTranspose2d with specific stride/padding
-#     # Adding an adaptive pool for simplicity to get to 224x224 before final conv
-#     nn.AdaptiveAvgPool2d((224, 224)),
-#
-#     nn.Conv2d(16, 3, kernel_size=1),
-#     nn.Sigmoid()  # Ensure output is in [0,1] range for images
-# )
-
-# --- Instantiate the New Decoder ---
-# You can adjust the hyperparameters here
-Decoder = lambda: TransformerPixelDecoder(
-    input_dim=768,          # DINOv2 feature dimension
-    hidden_dim=384,         # Internal dimension (multiple of nhead)
-    nhead=6,                # Number of attention heads
-    num_transformer_layers=4,# Number of transformer blocks
-    dim_feedforward=1536,   # Feedforward dimension in transformer
-    input_res=(16, 16),     # DINOv2 feature map size (check based on model)
-    output_res=(224, 224),  # Target image size
-    use_norm_in_upsample=True
+    # Final convolution to get 3 channels (RGB)
+    nn.Conv2d(16, 3, kernel_size=1),
+    nn.Sigmoid()  # Ensure output is in [0,1] range for images
 )
 
 
@@ -469,7 +251,7 @@ def train_decoder(args):
 
     # Initialize Decoder model
     decoder = Decoder().to(device)
-    # decoder = torch.compile(decoder)
+    decoder = torch.compile(decoder)
 
     # Watch model parameters and gradients with wandb
     wandb.watch(decoder, log='all', log_freq=100) # Log gradients every 100 batches
@@ -647,8 +429,8 @@ if __name__ == "__main__":
     parser.add_argument("--dinov2_model", type=str, default='facebook/dinov2-base', help="DINOv2 model name from Hugging Face.")
     parser.add_argument("--cache-latents", action=argparse.BooleanOptionalAction, default=True, help="Cache DINOv2 latents (default: True). Use --no-cache-latents to disable.")
     parser.add_argument("--cache_dir", type=str, default='dinov2_latents', help="Directory to cache DINOv2 latents.")
-    parser.add_argument("--batch_size", type=int, default=128, help="Batch size for training and latent extraction.")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training and latent extraction.")
+    parser.add_argument("--epochs", type=int, default=42, help="Number of training epochs.")
     parser.add_argument("--learning_rate", type=float, default=0.002, help="Learning rate for the optimizer.")
     parser.add_argument("--num_workers", type=int, default=2, help="Number of workers for the DataLoader.")
     parser.add_argument("--output_model_path", type=str, default="decoder_model.pth", help="Path to save the trained decoder model.")
