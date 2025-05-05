@@ -1,4 +1,5 @@
 __pycache__/
+wandb/
 
 dinov2_latents/
 unsplash_lite_image_dataset/

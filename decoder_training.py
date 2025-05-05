@@ -250,7 +250,8 @@ def train_decoder(args):
     fixed_latents_test = fixed_latents_test.to(device)
 
     # Initialize Decoder model
-    decoder = torch.compile(Decoder().to(device))
+    decoder = Decoder().to(device)
+    decoder = torch.compile(decoder)
 
     # Watch model parameters and gradients with wandb
     wandb.watch(decoder, log='all', log_freq=100) # Log gradients every 100 batches
