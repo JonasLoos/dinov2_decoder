@@ -10,6 +10,8 @@ import numpy as np
 from tqdm import tqdm
 import argparse
 import wandb
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.swa_utils import AveragedModel
 
 
 # --- DINOv2 Feature Extraction ---
@@ -90,25 +92,25 @@ class Decoder(nn.Module):
 
             # Block 1: 16x16 -> 28x28
             Upsample2d(512, 256, padding=0),
-            nn.BatchNorm2d(256),
+            nn.GroupNorm(256, 256),
             nn.GELU(),
             ConvWithSkip(256),
 
             # Block 2: 28x28 -> 56x56
             Upsample2d(256, 128),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(128, 128),
             nn.GELU(),
             ConvWithSkip(128),
 
             # Block 3: 56x56 -> 112x112
             Upsample2d(128, 64),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(64, 64),
             nn.GELU(),
             ConvWithSkip(64),
 
             # Block 4: 112x112 -> 224x224
             Upsample2d(64, 32),
-            nn.BatchNorm2d(32),
+            nn.GroupNorm(32, 32),
             nn.GELU(),
             ConvWithSkip(32),
 
@@ -127,10 +129,9 @@ class Decoder(nn.Module):
 # --- Dataset ---
 
 class LatentImageDataset(Dataset):
-    def __init__(self, latents: torch.Tensor, images: list[Image.Image], target_size=(224, 224)):
+    def __init__(self, latents: torch.Tensor, images: list[Image.Image]):
         self.latents = latents
         self.images = torch.tensor(np.array([np.array(image) for image in images])).permute(0, 3, 1, 2).float() / 255.0
-        self.target_size = target_size # DINOv2 default input size
         if len(latents) != len(images):
              raise ValueError("Number of latents and image paths must be the same.")
 
@@ -166,7 +167,7 @@ def train_decoder(args):
 
     # Load cached latents if available
     if args.cache_latents and Path(args.cache_dir).exists():
-        dinov2_latents = torch.load(Path(args.cache_dir) / 'dinov2_latents.pt')
+        dinov2_latents = torch.load(Path(args.cache_dir) / 'dinov2_latents.pt', weights_only=True)
         if len(dinov2_latents) != len(image_paths):
             print(f"Error: cached latents don't match image data")
             return
@@ -184,8 +185,7 @@ def train_decoder(args):
 
     # Create dataset and dataloader
     print("Creating dataset and dataloader...")
-    # Ensure target size matches DINOv2 standard input
-    dataset = LatentImageDataset(dinov2_latents, images, target_size=(224, 224))
+    dataset = LatentImageDataset(dinov2_latents, images)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -215,11 +215,22 @@ def train_decoder(args):
     wandb.watch(decoder, log='all', log_freq=100) # Log gradients every 100 batches
 
     # Loss and optimizer
-    optimizer = optim.Adam(decoder.parameters(), lr=args.learning_rate)
+    optimizer = optim.Adam(decoder.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    # EMA Model
+    ema_model = AveragedModel(decoder, device=device, avg_fn=lambda averaged_model_parameter, model_parameter, num_averaged: args.ema_decay * averaged_model_parameter + (1 - args.ema_decay) * model_parameter)
+
+    # Schedulers
+    warmup_iters = args.warmup_epochs * len(dataloader)
+    total_iters = args.epochs * len(dataloader)
+    scheduler_warmup = LinearLR(optimizer, start_factor=0.001, total_iters=warmup_iters)
+    scheduler_cosine = CosineAnnealingLR(optimizer, T_max=total_iters - warmup_iters, eta_min=args.learning_rate * 0.01)
+    scheduler = SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[warmup_iters])
 
     # Training loop
     print("Starting training...")
     decoder.train()
+    ema_model.train()
     try:
         for epoch in range(args.epochs):
             running_loss = 0.0
@@ -242,10 +253,19 @@ def train_decoder(args):
                 # Backward pass and optimize
                 loss.backward()
                 optimizer.step()
+                ema_model.update_parameters(model=decoder) # Update EMA weights
+                scheduler.step() # Update learning rate
 
-                # Log loss to wandb
+                # Log loss and LR to wandb
                 psnr = -10 * torch.log10(l2_loss)
-                wandb.log({"l1_loss": l1_loss.item(), "l2_loss": l2_loss.item(), "psnr": psnr.item()})
+                current_lr = optimizer.param_groups[0]['lr']
+                wandb.log({
+                    "l1_loss": l1_loss.item(),
+                    "l2_loss": l2_loss.item(),
+                    "psnr": psnr.item(),
+                    "learning_rate": current_lr,
+                    "epoch": epoch,
+                })
 
                 running_loss += l1_loss.item()
 
@@ -255,20 +275,21 @@ def train_decoder(args):
                     progress_bar.set_postfix({'loss': f'{avg_loss:.4f}'})
                     running_loss = 0.0
 
-            # Log sample reconstructions at the end of each epoch
-            decoder.eval() # Set model to evaluation mode
+            # Log sample reconstructions at the end of each epoch using EMA model
+            ema_model.eval()
             with torch.no_grad():
-                output_images = decoder(fixed_latents_batch)
-            decoder.train() # Set model back to train mode
+                # Generate reconstructions
+                output_images_ema = ema_model(fixed_latents_batch)
+            ema_model.train()
 
-            # Prepare images for logging (log first 8 images from the fixed batch)
+            # Prepare images for logging (log first 4 images from the fixed batch)
             log_images = []
             num_samples_to_log = min(4, args.batch_size)
             for j in range(num_samples_to_log):
                 original = fixed_target_images_batch[j].cpu().permute(1, 2, 0).numpy()
-                reconstructed = output_images[j].cpu().permute(1, 2, 0).numpy()
+                reconstructed = output_images_ema[j].cpu().permute(1, 2, 0).numpy()
                 log_images.append(wandb.Image(original, caption=f"Epoch {epoch+1} - Original {j}"))
-                log_images.append(wandb.Image(reconstructed, caption=f"Epoch {epoch+1} - Reconstructed {j}"))
+                log_images.append(wandb.Image(reconstructed, caption=f"Epoch {epoch+1} - EMA Reconstructed {j}"))
 
             wandb.log({
                 "epoch": epoch + 1,
@@ -282,10 +303,11 @@ def train_decoder(args):
         print(f"Error: {e}")
         print("Training interrupted by error. Saving model...")
     finally:
-        # Save the trained decoder model
+        # Save the trained EMA decoder model
         if args.output_model_path:
-            print(f"Saving model to {args.output_model_path}")
-            torch.save(decoder.state_dict(), args.output_model_path)
+            print(f"Saving EMA model to {args.output_model_path}")
+            # The AveragedModel wraps the original model, access the module for the state dict
+            torch.save(ema_model.module.state_dict(), args.output_model_path)
             print("Model saved.")
             model_artifact = wandb.Artifact(args.output_model_path, type="model")
             model_artifact.add_file(args.output_model_path)
@@ -306,6 +328,9 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=0.002, help="Learning rate for the optimizer.")
     parser.add_argument("--num_workers", type=int, default=2, help="Number of workers for the DataLoader.")
     parser.add_argument("--output_model_path", type=str, default="decoder_model.pth", help="Path to save the trained decoder model.")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for the Adam optimizer.")
+    parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of epochs for linear learning rate warmup.")
+    parser.add_argument("--ema_decay", type=float, default=0.995, help="Decay factor for Exponential Moving Average of model weights.")
 
     # Wandb arguments
     parser.add_argument("--wandb_project", type=str, default="dinov2_decoder", help="Wandb project name.")
