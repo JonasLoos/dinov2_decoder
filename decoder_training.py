@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 from transformers import AutoImageProcessor, AutoModel
 from PIL import Image
 from pathlib import Path
@@ -65,6 +66,20 @@ class ConvWithSkip(nn.Module):
         return self.nn(x) + x
 
 
+class Upsample2d(nn.Module):
+    def __init__(self, in_channels, out_channels, padding=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels*4, kernel_size=3, padding=padding)
+
+    def forward(self, x):
+        x = self.conv(x)
+        b, c, h, w = x.shape
+        x = x.reshape(b, c//4, 2, 2, h, w)
+        x = x.permute(0, 1, 4, 2, 5, 3)
+        x = x.reshape(b, c//4, h*2, w*2)
+        return x
+
+
 class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -74,25 +89,25 @@ class Decoder(nn.Module):
             nn.Conv2d(768, 512, kernel_size=1),
 
             # Block 1: 16x16 -> 28x28
-            nn.ConvTranspose2d(512, 256, kernel_size=3, stride=2, padding=3, output_padding=1),
+            Upsample2d(512, 256, padding=0),
             nn.BatchNorm2d(256),
             nn.GELU(),
             ConvWithSkip(256),
 
             # Block 2: 28x28 -> 56x56
-            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
+            Upsample2d(256, 128),
             nn.BatchNorm2d(128),
             nn.GELU(),
             ConvWithSkip(128),
 
             # Block 3: 56x56 -> 112x112
-            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            Upsample2d(128, 64),
             nn.BatchNorm2d(64),
             nn.GELU(),
             ConvWithSkip(64),
 
             # Block 4: 112x112 -> 224x224
-            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
+            Upsample2d(64, 32),
             nn.BatchNorm2d(32),
             nn.GELU(),
             ConvWithSkip(32),
@@ -200,7 +215,6 @@ def train_decoder(args):
     wandb.watch(decoder, log='all', log_freq=100) # Log gradients every 100 batches
 
     # Loss and optimizer
-    criterion = nn.L1Loss()
     optimizer = optim.Adam(decoder.parameters(), lr=args.learning_rate)
 
     # Training loop
@@ -221,18 +235,19 @@ def train_decoder(args):
                 output_images = decoder(latents_batch)
 
                 # Calculate loss
-                loss = criterion(output_images, target_images_batch)
+                l1_loss = F.l1_loss(output_images, target_images_batch)
+                l2_loss = F.mse_loss(output_images, target_images_batch)
+                loss = l1_loss + l2_loss
 
                 # Backward pass and optimize
                 loss.backward()
                 optimizer.step()
 
                 # Log loss to wandb
-                l2_loss = nn.MSELoss()(output_images, target_images_batch)
                 psnr = -10 * torch.log10(l2_loss)
-                wandb.log({"l1_loss": loss.item(), "l2_loss": l2_loss.item(), "psnr": psnr.item()})
+                wandb.log({"l1_loss": l1_loss.item(), "l2_loss": l2_loss.item(), "psnr": psnr.item()})
 
-                running_loss += loss.item()
+                running_loss += l1_loss.item()
 
                 # Update progress bar
                 if i % 10 == 9: # Log every 10 batches
