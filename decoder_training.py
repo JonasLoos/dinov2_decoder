@@ -55,19 +55,6 @@ def get_dinov2_latents(image_paths, processor, model, device, batch_size=32):
 
 # --- Decoder Model ---
 
-class ConvWithSkip(nn.Module):
-    def __init__(self, num_features):
-        super().__init__()
-        self.nn = nn.Sequential(
-            nn.Conv2d(num_features, num_features, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(num_features, num_features, kernel_size=1),
-        )
-
-    def forward(self, x):
-        return self.nn(x) + x
-
-
 class Upsample2d(nn.Module):
     def __init__(self, in_channels, out_channels, padding=1):
         super().__init__()
@@ -94,25 +81,39 @@ class Decoder(nn.Module):
             Upsample2d(512, 256, padding=0),
             nn.GroupNorm(256, 256),
             nn.GELU(),
-            ConvWithSkip(256),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.GroupNorm(256, 256),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.GroupNorm(256, 256),
 
             # Block 2: 28x28 -> 56x56
             Upsample2d(256, 128),
             nn.GroupNorm(128, 128),
             nn.GELU(),
-            ConvWithSkip(128),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.GroupNorm(128, 128),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.GroupNorm(128, 128),
 
             # Block 3: 56x56 -> 112x112
             Upsample2d(128, 64),
             nn.GroupNorm(64, 64),
             nn.GELU(),
-            ConvWithSkip(64),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.GroupNorm(64, 64),
 
             # Block 4: 112x112 -> 224x224
             Upsample2d(64, 32),
             nn.GroupNorm(32, 32),
             nn.GELU(),
-            ConvWithSkip(32),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.GroupNorm(32, 32),
 
             # Final convolution to get 3 channels (RGB)
             nn.Conv2d(32, 3, kernel_size=1),
@@ -179,7 +180,7 @@ def train_decoder(args):
         dinov2_model = AutoModel.from_pretrained(args.dinov2_model)
         dinov2_latents = get_dinov2_latents(image_paths, processor, dinov2_model, device, args.batch_size)
         if args.cache_latents:
-            print(f"Caching DINOv2 latents to {args.cache_dir}...")
+            print(f"Caching DINOv2 latents to folder `{args.cache_dir}` ...")
             Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
             torch.save(dinov2_latents, Path(args.cache_dir) / 'dinov2_latents.pt')
 
@@ -328,9 +329,9 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=0.002, help="Learning rate for the optimizer.")
     parser.add_argument("--num_workers", type=int, default=2, help="Number of workers for the DataLoader.")
     parser.add_argument("--output_model_path", type=str, default="decoder_model.pth", help="Path to save the trained decoder model.")
-    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for the Adam optimizer.")
+    parser.add_argument("--weight_decay", type=float, default=5e-5, help="Weight decay for the Adam optimizer.")
     parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of epochs for linear learning rate warmup.")
-    parser.add_argument("--ema_decay", type=float, default=0.995, help="Decay factor for Exponential Moving Average of model weights.")
+    parser.add_argument("--ema_decay", type=float, default=0.99, help="Decay factor for Exponential Moving Average of model weights.")
 
     # Wandb arguments
     parser.add_argument("--wandb_project", type=str, default="dinov2_decoder", help="Wandb project name.")
