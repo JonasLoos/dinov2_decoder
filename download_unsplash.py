@@ -19,9 +19,9 @@ RAW_IMAGES_DIR = DATA_DIR / 'images'
 TRAINING_IMAGES_DIR = DATA_DIR / 'training_images'
 DATASET_URL = "https://unsplash-datasets.s3.amazonaws.com/lite/latest/unsplash-research-dataset-lite-latest.zip"
 DOCUMENTS_TO_LOAD = ['photos']#, 'keywords', 'collections', 'conversions', 'colors']
-NUM_IMAGES_TO_DOWNLOAD = 100 # Number of raw images to download
+NUM_IMAGES_TO_DOWNLOAD = 500 # Number of raw images to download
 CROP_SIZE = 224
-MAX_CROPS_PER_IMAGE = 10
+MAX_CROPS_PER_IMAGE = 8
 
 
 # --- Helper Functions ---
@@ -165,7 +165,7 @@ def generate_training_images(raw_img_dir: Path, training_img_dir: Path, crop_siz
             # Calculate maximum possible downscales before image is smaller than crop_size
             max_downscales = math.floor(math.log2(min(w, h) / crop_size))
 
-            for downscale in range(max_downscales + 1): # Include 0 (original size)
+            for downscale in range(1, max_downscales + 1): # Exclude 0 (original size), due to heavy focus on texture only
                 current_w = w // (2**downscale)
                 current_h = h // (2**downscale)
 
