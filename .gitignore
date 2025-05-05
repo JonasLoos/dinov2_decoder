@@ -1,0 +1,4 @@
+__pycache__/
+
+dinov2_latents/
+unsplash_lite_image_dataset/
