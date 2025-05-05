@@ -72,6 +72,19 @@ def get_dinov2_latents(image_paths, processor, model, device, batch_size=32):
 
 # --- Decoder Model ---
 
+class ConvWithSkip(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        self.nn = nn.Sequential(
+            nn.Conv2d(num_features, num_features, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(num_features, num_features, kernel_size=1),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        return self.nn(x) + x
+
 class Upsample2d(nn.Module):
     def __init__(self, in_channels, out_channels, padding=1):
         super().__init__()
@@ -83,65 +96,34 @@ class Upsample2d(nn.Module):
         x = x.reshape(b, c//4, 2, 2, h, w)
         x = x.permute(0, 1, 4, 2, 5, 3)
         x = x.reshape(b, c//4, h*2, w*2)
+        x = F.gelu(x)
         return x
 
 
-class Decoder(nn.Module):
-    def __init__(self):
-        super().__init__()
+Decoder = lambda: nn.Sequential(
+    # Initial projection
+    nn.Conv2d(768, 512, kernel_size=1),
 
-        self.decoder = nn.Sequential(
-            # Initial projection
-            nn.Conv2d(768, 512, kernel_size=1),
+    # Block 1: 16x16 -> 28x28
+    Upsample2d(512, 256, padding=0),
+    ConvWithSkip(256),
 
-            # Block 1: 16x16 -> 28x28
-            Upsample2d(512, 256, padding=0),
-            nn.GroupNorm(256, 256),
-            nn.GELU(),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.GroupNorm(256, 256),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.GroupNorm(256, 256),
+    # Block 2: 28x28 -> 56x56
+    Upsample2d(256, 128),
+    ConvWithSkip(128),
 
-            # Block 2: 28x28 -> 56x56
-            Upsample2d(256, 128),
-            nn.GroupNorm(128, 128),
-            nn.GELU(),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.GroupNorm(128, 128),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.GroupNorm(128, 128),
+    # Block 3: 56x56 -> 112x112
+    Upsample2d(128, 64),
+    ConvWithSkip(64),
 
-            # Block 3: 56x56 -> 112x112
-            Upsample2d(128, 64),
-            nn.GroupNorm(64, 64),
-            nn.GELU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.GroupNorm(64, 64),
+    # Block 4: 112x112 -> 224x224
+    Upsample2d(64, 32),
+    ConvWithSkip(32),
 
-            # Block 4: 112x112 -> 224x224
-            Upsample2d(64, 32),
-            nn.GroupNorm(32, 32),
-            nn.GELU(),
-            nn.Conv2d(32, 32, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.GroupNorm(32, 32),
-
-            # Final convolution to get 3 channels (RGB)
-            nn.Conv2d(32, 3, kernel_size=1),
-            nn.Sigmoid()  # Ensure output is in [0,1] range for images
-        )
-
-    def forward(self, x):
-        # x shape: (B, 768, 16, 16)
-        x = self.decoder(x)
-        # x shape: (B, 3, 224, 224)
-        return x
+    # Final convolution to get 3 channels (RGB)
+    nn.Conv2d(32, 3, kernel_size=1),
+    nn.Sigmoid()  # Ensure output is in [0,1] range for images
+)
 
 
 # --- Dataset ---
@@ -283,7 +265,10 @@ def train_decoder(args):
     optimizer = optim.Adam(decoder.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
     # EMA Model
-    ema_model = AveragedModel(decoder, device=device, avg_fn=lambda averaged_model_parameter, model_parameter, num_averaged: args.ema_decay * averaged_model_parameter + (1 - args.ema_decay) * model_parameter)
+    ema_model = None
+    if args.ema_decay > 0:
+        ema_model = AveragedModel(decoder, device=device, avg_fn=lambda averaged_model_parameter, model_parameter, num_averaged: args.ema_decay * averaged_model_parameter + (1 - args.ema_decay) * model_parameter)
+        print(f"EMA enabled with decay: {args.ema_decay}")
 
     # Schedulers
     warmup_iters = args.warmup_epochs * len(train_dataloader)
@@ -294,13 +279,12 @@ def train_decoder(args):
 
     # Training loop
     print("Starting training...")
-    decoder.train()
-    ema_model.train()
     try:
         global_step = 0 # Track total steps for logging
         for epoch in range(args.epochs):
             decoder.train() # Ensure model is in training mode
-            ema_model.train() # Ensure EMA model is in training mode (for batchnorm/dropout if added later)
+            if ema_model:
+                ema_model.train() # Ensure EMA model is in training mode
             running_loss = 0.0
             progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}") # Use train_dataloader
 
@@ -321,7 +305,8 @@ def train_decoder(args):
                 # Backward pass and optimize
                 loss.backward()
                 optimizer.step()
-                ema_model.update_parameters(model=decoder) # Update EMA weights
+                if ema_model:
+                    ema_model.update_parameters(model=decoder) # Update EMA weights
                 scheduler.step() # Update learning rate
 
                 # Log training loss and LR to wandb
@@ -347,7 +332,9 @@ def train_decoder(args):
                     running_loss = 0.0
 
             # --- Evaluation on Test Set ---
-            ema_model.eval() # Use EMA model for evaluation
+            eval_model = ema_model if ema_model else decoder # Use EMA if available, otherwise use base model
+            eval_model.eval() # Set the chosen model to evaluation mode
+
             test_l1_loss = 0.0
             test_l2_loss = 0.0
             test_psnr = 0.0
@@ -358,7 +345,7 @@ def train_decoder(args):
                     target_images_batch = target_images_batch.to(device)
 
                     # Forward pass with EMA model
-                    output_images_ema = ema_model(latents_batch)
+                    output_images_ema = eval_model(latents_batch)
 
                     # Calculate test loss
                     batch_l1 = F.l1_loss(output_images_ema, target_images_batch)
@@ -387,7 +374,7 @@ def train_decoder(args):
             # --- Log sample reconstructions (using EMA model) ---
             with torch.no_grad():
                 # Generate reconstructions using the fixed test batch
-                output_images_ema = ema_model(fixed_latents_batch)
+                output_images_ema = eval_model(fixed_latents_batch)
 
             # Prepare images for logging (log first 4 images from the fixed test batch)
             log_images = []
@@ -396,10 +383,10 @@ def train_decoder(args):
                 original = fixed_target_images_batch[j].cpu().permute(1, 2, 0).numpy()
                 reconstructed = output_images_ema[j].cpu().permute(1, 2, 0).clamp(0, 1).numpy() # Clamp output just in case
                 log_images.append(wandb.Image(original, caption=f"Epoch {epoch+1} - Test Original {j}"))
-                log_images.append(wandb.Image(reconstructed, caption=f"Epoch {epoch+1} - Test EMA Reconstructed {j}"))
+                log_images.append(wandb.Image(reconstructed, caption=f"Epoch {epoch+1} - Test Reconstructed {j}"))
 
             wandb.log({
-                "test/sample_reconstructions": log_images,
+                f"test/sample_reconstructions": log_images,
                 "epoch": epoch + 1,
                 "step": global_step
             })
@@ -413,13 +400,20 @@ def train_decoder(args):
     finally:
         # Save the trained EMA decoder model
         if args.output_model_path:
-            print(f"Saving EMA model to {args.output_model_path}")
-            # Access the underlying model module for the state dict
             output_dir = Path(args.output_model_path).parent
             output_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(ema_model.module.state_dict(), args.output_model_path)
+            if ema_model:
+                print(f"Saving EMA model to {args.output_model_path}")
+                # Access the underlying model module for the state dict
+                torch.save(ema_model.module.state_dict(), args.output_model_path)
+                model_artifact_name = f"{Path(args.output_model_path).stem}_ema"
+            else:
+                print(f"Saving base model to {args.output_model_path}")
+                torch.save(decoder.state_dict(), args.output_model_path)
+                model_artifact_name = Path(args.output_model_path).stem
+
             print("Model saved.")
-            model_artifact = wandb.Artifact(Path(args.output_model_path).name, type="model")
+            model_artifact = wandb.Artifact(model_artifact_name, type="model")
             model_artifact.add_file(args.output_model_path)
             wandb.log_artifact(model_artifact)
 
@@ -434,13 +428,13 @@ if __name__ == "__main__":
     parser.add_argument("--cache-latents", action=argparse.BooleanOptionalAction, default=True, help="Cache DINOv2 latents (default: True). Use --no-cache-latents to disable.")
     parser.add_argument("--cache_dir", type=str, default='dinov2_latents', help="Directory to cache DINOv2 latents.")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training and latent extraction.")
-    parser.add_argument("--epochs", type=int, default=60, help="Number of training epochs.")
+    parser.add_argument("--epochs", type=int, default=42, help="Number of training epochs.")
     parser.add_argument("--learning_rate", type=float, default=0.002, help="Learning rate for the optimizer.")
     parser.add_argument("--num_workers", type=int, default=2, help="Number of workers for the DataLoader.")
     parser.add_argument("--output_model_path", type=str, default="decoder_model.pth", help="Path to save the trained decoder model.")
     parser.add_argument("--weight_decay", type=float, default=5e-5, help="Weight decay for the Adam optimizer.")
     parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of epochs for linear learning rate warmup.")
-    parser.add_argument("--ema_decay", type=float, default=0.99, help="Decay factor for Exponential Moving Average of model weights.")
+    parser.add_argument("--ema_decay", type=float, default=0, help="Decay factor for Exponential Moving Average of model weights. Set to 0 to disable EMA.")
     parser.add_argument("--test_split_ratio", type=float, default=0.1, help="Fraction of data to use for the test set (default: 0.1).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42).")
 
