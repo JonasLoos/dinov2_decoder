@@ -70,48 +70,6 @@ def get_dinov2_latents(image_paths, processor, model, device, batch_size=32):
     return torch.cat(all_latents, dim=0).permute(0, 3, 1, 2)
 
 
-# --- Attention Block ---
-
-class SelfAttentionBlock(nn.Module):
-    """Adds self-attention to a feature map."""
-    def __init__(self, num_features: int, num_heads: int = 4, dropout: float = 0.0):
-        super().__init__()
-        if num_features % num_heads != 0:
-            raise ValueError(f"num_features ({num_features}) must be divisible by num_heads ({num_heads})")
-        self.num_heads = num_heads
-        self.norm = nn.LayerNorm(num_features)
-        # Using a single linear layer for q, k, v for efficiency, rather than three separate ones
-        self.qkv = nn.Linear(num_features, num_features * 3)
-        self.attn = nn.MultiheadAttention(num_features, num_heads, dropout=dropout, batch_first=False) # Expects (Seq, Batch, Feat)
-        self.proj = nn.Linear(num_features, num_features) # Optional projection after attention
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        # Reshape for attention: (B, C, H, W) -> (B, C, H*W) -> (H*W, B, C)
-        x_resid = x
-        x = x.view(B, C, H * W).permute(2, 0, 1) # (H*W, B, C)
-
-        # LayerNorm
-        x_norm = self.norm(x)
-
-        # Get Q, K, V from a single projection
-        # qkv shape: (H*W, B, C*3)
-        qkv = self.qkv(x_norm)
-        # Split Q, K, V
-        q, k, v = qkv.chunk(3, dim=-1) # (H*W, B, C) each
-
-        # Apply MultiheadAttention
-        attn_output, _ = self.attn(q, k, v) # (H*W, B, C)
-
-        # Optional Projection
-        attn_output = self.proj(attn_output)
-
-        # Reshape back and add residual connection: (H*W, B, C) -> (B, C, H*W) -> (B, C, H, W)
-        attn_output = attn_output.permute(1, 2, 0).view(B, C, H, W)
-
-        return x_resid + attn_output
-
-
 # --- Decoder Model ---
 
 class ConvWithSkip(nn.Module):
@@ -149,7 +107,6 @@ Decoder = lambda: nn.Sequential(
     # Block 1: 16x16 -> 28x28
     Upsample2d(256, 128, padding=0),
     ConvWithSkip(128),
-    SelfAttentionBlock(128, num_heads=4),
 
     # Block 2: 28x28 -> 56x56
     Upsample2d(128, 64),
