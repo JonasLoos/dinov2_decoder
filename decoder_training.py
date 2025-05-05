@@ -12,6 +12,23 @@ import argparse
 import wandb
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch.optim.swa_utils import AveragedModel
+import random
+
+
+# --- Reproducibility ---
+
+def set_seed(seed):
+    """Sets the seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed) # if you are using multi-GPU.
+    # Ensure deterministic behavior for certain CUDA operations
+    # Note: This might impact performance.
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
 
 
 # --- DINOv2 Feature Extraction ---
@@ -149,6 +166,9 @@ def train_decoder(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # Set seed for reproducibility
+    set_seed(args.seed)
+
     # Initialize wandb
     wandb.init(
         project=args.wandb_project,
@@ -159,52 +179,96 @@ def train_decoder(args):
 
     # List images
     print(f"Scanning for images in {args.image_dir}...")
-    image_paths = list(Path(args.image_dir).glob('*.jpg'))
-    images = [Image.open(path).convert('RGB') for path in image_paths]
-    print(f"Loaded {len(image_paths)} images.")
-    if not image_paths:
+    all_image_paths = sorted(list(Path(args.image_dir).glob('*.jpg'))) # Sort for consistent splits
+    print(f"Found {len(all_image_paths)} images.")
+    if not all_image_paths:
         print("No images found. Exiting.")
         return
 
     # Load cached latents if available
-    if args.cache_latents and Path(args.cache_dir).exists():
-        dinov2_latents = torch.load(Path(args.cache_dir) / 'dinov2_latents.pt', weights_only=True)
-        if len(dinov2_latents) != len(image_paths):
-            print(f"Error: cached latents don't match image data")
-            return
-        print(f"Loaded DINOv2 latents from {args.cache_dir}.")
+    cache_file = Path(args.cache_dir) / 'dinov2_latents.pt'
+    if args.cache_latents and cache_file.exists():
+        dinov2_latents = torch.load(cache_file, weights_only=True)
+        if len(dinov2_latents) != len(all_image_paths):
+            print(f"Error: cached latents length ({len(dinov2_latents)}) doesn't match image count ({len(all_image_paths)}). Recalculating.")
+            dinov2_latents = None # Force recalculation
+        else:
+            print(f"Loaded DINOv2 latents from {cache_file}.")
     else:
+        dinov2_latents = None
+
+    if dinov2_latents is None:
         # Load DINOv2 model and processor
         print("Loading DINOv2 model and processor...")
         processor = AutoImageProcessor.from_pretrained(args.dinov2_model)
         dinov2_model = AutoModel.from_pretrained(args.dinov2_model)
-        dinov2_latents = get_dinov2_latents(image_paths, processor, dinov2_model, device, args.batch_size)
+        # Load all images *before* latent extraction
+        all_images = [Image.open(path).convert('RGB') for path in all_image_paths]
+        dinov2_latents = get_dinov2_latents(all_image_paths, processor, dinov2_model, device, args.batch_size)
         if args.cache_latents:
             print(f"Caching DINOv2 latents to folder `{args.cache_dir}` ...")
             Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
-            torch.save(dinov2_latents, Path(args.cache_dir) / 'dinov2_latents.pt')
+            torch.save(dinov2_latents, cache_file)
+    else:
+        # Load images only if latents were cached successfully
+        print("Loading images...")
+        all_images = [Image.open(path).convert('RGB') for path in tqdm(all_image_paths, desc="Loading Images")]
 
-    # Create dataset and dataloader
-    print("Creating dataset and dataloader...")
-    dataset = LatentImageDataset(dinov2_latents, images)
-    dataloader = DataLoader(
-        dataset,
+
+    # --- Train/Test Split ---
+    print(f"Splitting data into train/test sets (test ratio: {args.test_split_ratio})...")
+    indices = list(range(len(all_image_paths)))
+    test_size = int(len(indices) * args.test_split_ratio)
+
+    # test/train split
+    generator = torch.Generator().manual_seed(args.seed)
+    perm = torch.randperm(len(indices), generator=generator)
+    test_indices = [indices[i] for i in perm[:test_size]]
+    train_indices = [indices[i] for i in perm[test_size:]]
+
+    train_latents = dinov2_latents[train_indices]
+    test_latents = dinov2_latents[test_indices]
+    train_images = [all_images[i] for i in train_indices]
+    test_images = [all_images[i] for i in test_indices]
+
+    print(f"Train set size: {len(train_images)}")
+    print(f"Test set size: {len(test_images)}")
+
+    # Create datasets and dataloaders
+    print("Creating datasets and dataloaders...")
+    train_dataset = LatentImageDataset(train_latents, train_images)
+    test_dataset = LatentImageDataset(test_latents, test_images)
+
+    # Use a generator for reproducible shuffling in training dataloader
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
+    train_dataloader = DataLoader(
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True if device == torch.device("cuda") else False,
+        worker_init_fn=lambda worker_id: np.random.seed(args.seed + worker_id), # For reproducibility
+        generator=g
+    )
+
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False, # No need to shuffle test data
         num_workers=args.num_workers,
         pin_memory=True if device == torch.device("cuda") else False
     )
 
-    # Create a non-shuffled dataloader for deterministic visualization batch
+    # Get a fixed batch from the *test* set for visualization
     vis_dataloader = DataLoader(
-        dataset,
+        test_dataset, # Use test set
         batch_size=args.batch_size,
         shuffle=False, # Ensure deterministic batch selection
         num_workers=args.num_workers,
         pin_memory=True if device == torch.device("cuda") else False
     )
-
-    # Get a fixed batch for visualization
     fixed_latents_batch, fixed_target_images_batch = next(iter(vis_dataloader))
     fixed_latents_batch = fixed_latents_batch.to(device)
     fixed_target_images_batch = fixed_target_images_batch.to(device)
@@ -222,8 +286,8 @@ def train_decoder(args):
     ema_model = AveragedModel(decoder, device=device, avg_fn=lambda averaged_model_parameter, model_parameter, num_averaged: args.ema_decay * averaged_model_parameter + (1 - args.ema_decay) * model_parameter)
 
     # Schedulers
-    warmup_iters = args.warmup_epochs * len(dataloader)
-    total_iters = args.epochs * len(dataloader)
+    warmup_iters = args.warmup_epochs * len(train_dataloader)
+    total_iters = args.epochs * len(train_dataloader)
     scheduler_warmup = LinearLR(optimizer, start_factor=0.001, total_iters=warmup_iters)
     scheduler_cosine = CosineAnnealingLR(optimizer, T_max=total_iters - warmup_iters, eta_min=args.learning_rate * 0.01)
     scheduler = SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[warmup_iters])
@@ -233,9 +297,12 @@ def train_decoder(args):
     decoder.train()
     ema_model.train()
     try:
+        global_step = 0 # Track total steps for logging
         for epoch in range(args.epochs):
+            decoder.train() # Ensure model is in training mode
+            ema_model.train() # Ensure EMA model is in training mode (for batchnorm/dropout if added later)
             running_loss = 0.0
-            progress_bar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}")
+            progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}") # Use train_dataloader
 
             for i, (latents_batch, target_images_batch) in enumerate(progress_bar):
                 latents_batch = latents_batch.to(device)
@@ -243,7 +310,7 @@ def train_decoder(args):
 
                 optimizer.zero_grad()
 
-                # Forward pass
+                # Forward pass (standard model)
                 output_images = decoder(latents_batch)
 
                 # Calculate loss
@@ -257,45 +324,85 @@ def train_decoder(args):
                 ema_model.update_parameters(model=decoder) # Update EMA weights
                 scheduler.step() # Update learning rate
 
-                # Log loss and LR to wandb
+                # Log training loss and LR to wandb
                 psnr = -10 * torch.log10(l2_loss)
                 current_lr = optimizer.param_groups[0]['lr']
                 wandb.log({
-                    "l1_loss": l1_loss.item(),
-                    "l2_loss": l2_loss.item(),
-                    "psnr": psnr.item(),
+                    "train/l1_loss": l1_loss.item(),
+                    "train/l2_loss": l2_loss.item(),
+                    "train/loss": loss.item(),
+                    "train/psnr": psnr.item(),
                     "learning_rate": current_lr,
                     "epoch": epoch,
+                    "step": global_step
                 })
+                global_step += 1
 
-                running_loss += l1_loss.item()
+                running_loss += loss.item() # Use combined loss for progress bar
 
                 # Update progress bar
                 if i % 10 == 9: # Log every 10 batches
                     avg_loss = running_loss / 10
-                    progress_bar.set_postfix({'loss': f'{avg_loss:.4f}'})
+                    progress_bar.set_postfix({'loss': f'{avg_loss:.4f}', 'lr': f'{current_lr:.6f}'})
                     running_loss = 0.0
 
-            # Log sample reconstructions at the end of each epoch using EMA model
-            ema_model.eval()
+            # --- Evaluation on Test Set ---
+            ema_model.eval() # Use EMA model for evaluation
+            test_l1_loss = 0.0
+            test_l2_loss = 0.0
+            test_psnr = 0.0
+            num_test_batches = 0
             with torch.no_grad():
-                # Generate reconstructions
-                output_images_ema = ema_model(fixed_latents_batch)
-            ema_model.train()
+                for latents_batch, target_images_batch in tqdm(test_dataloader, desc=f"Epoch {epoch + 1} Test Eval"):
+                    latents_batch = latents_batch.to(device)
+                    target_images_batch = target_images_batch.to(device)
 
-            # Prepare images for logging (log first 4 images from the fixed batch)
-            log_images = []
-            num_samples_to_log = min(4, args.batch_size)
-            for j in range(num_samples_to_log):
-                original = fixed_target_images_batch[j].cpu().permute(1, 2, 0).numpy()
-                reconstructed = output_images_ema[j].cpu().permute(1, 2, 0).numpy()
-                log_images.append(wandb.Image(original, caption=f"Epoch {epoch+1} - Original {j}"))
-                log_images.append(wandb.Image(reconstructed, caption=f"Epoch {epoch+1} - EMA Reconstructed {j}"))
+                    # Forward pass with EMA model
+                    output_images_ema = ema_model(latents_batch)
+
+                    # Calculate test loss
+                    batch_l1 = F.l1_loss(output_images_ema, target_images_batch)
+                    batch_l2 = F.mse_loss(output_images_ema, target_images_batch)
+                    batch_psnr = -10 * torch.log10(batch_l2)
+
+                    test_l1_loss += batch_l1.item()
+                    test_l2_loss += batch_l2.item()
+                    test_psnr += batch_psnr.item()
+                    num_test_batches += 1
+
+            avg_test_l1 = test_l1_loss / num_test_batches
+            avg_test_l2 = test_l2_loss / num_test_batches
+            avg_test_psnr = test_psnr / num_test_batches
 
             wandb.log({
+                "test/l1_loss": avg_test_l1,
+                "test/l2_loss": avg_test_l2,
+                "test/psnr": avg_test_psnr,
+                "epoch": epoch + 1, # Log test metrics against epoch number
+                "step": global_step # Log against global step as well
+            })
+            print(f"Epoch {epoch + 1} Test Results: L1={avg_test_l1:.4f}, L2={avg_test_l2:.4f}, PSNR={avg_test_psnr:.4f}")
+
+
+            # --- Log sample reconstructions (using EMA model) ---
+            with torch.no_grad():
+                # Generate reconstructions using the fixed test batch
+                output_images_ema = ema_model(fixed_latents_batch)
+
+            # Prepare images for logging (log first 4 images from the fixed test batch)
+            log_images = []
+            num_samples_to_log = min(4, args.batch_size, len(fixed_target_images_batch)) # Handle smaller test sets/batches
+            for j in range(num_samples_to_log):
+                original = fixed_target_images_batch[j].cpu().permute(1, 2, 0).numpy()
+                reconstructed = output_images_ema[j].cpu().permute(1, 2, 0).clamp(0, 1).numpy() # Clamp output just in case
+                log_images.append(wandb.Image(original, caption=f"Epoch {epoch+1} - Test Original {j}"))
+                log_images.append(wandb.Image(reconstructed, caption=f"Epoch {epoch+1} - Test EMA Reconstructed {j}"))
+
+            wandb.log({
+                "test/sample_reconstructions": log_images,
                 "epoch": epoch + 1,
-                "sample_reconstructions": log_images,
-            }, step=(epoch+1) * len(dataloader))
+                "step": global_step
+            })
 
         print('Finished Training')
     except KeyboardInterrupt:
@@ -307,10 +414,12 @@ def train_decoder(args):
         # Save the trained EMA decoder model
         if args.output_model_path:
             print(f"Saving EMA model to {args.output_model_path}")
-            # The AveragedModel wraps the original model, access the module for the state dict
+            # Access the underlying model module for the state dict
+            output_dir = Path(args.output_model_path).parent
+            output_dir.mkdir(parents=True, exist_ok=True)
             torch.save(ema_model.module.state_dict(), args.output_model_path)
             print("Model saved.")
-            model_artifact = wandb.Artifact(args.output_model_path, type="model")
+            model_artifact = wandb.Artifact(Path(args.output_model_path).name, type="model")
             model_artifact.add_file(args.output_model_path)
             wandb.log_artifact(model_artifact)
 
@@ -332,6 +441,8 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=5e-5, help="Weight decay for the Adam optimizer.")
     parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of epochs for linear learning rate warmup.")
     parser.add_argument("--ema_decay", type=float, default=0.99, help="Decay factor for Exponential Moving Average of model weights.")
+    parser.add_argument("--test_split_ratio", type=float, default=0.1, help="Fraction of data to use for the test set (default: 0.1).")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42).")
 
     # Wandb arguments
     parser.add_argument("--wandb_project", type=str, default="dinov2_decoder", help="Wandb project name.")
