@@ -102,26 +102,26 @@ class Upsample2d(nn.Module):
 
 Decoder = lambda: nn.Sequential(
     # Initial projection
-    nn.Conv2d(768, 512, kernel_size=1),
+    nn.Conv2d(768, 256, kernel_size=1),
 
     # Block 1: 16x16 -> 28x28
-    Upsample2d(512, 256, padding=0),
-    ConvWithSkip(256),
-
-    # Block 2: 28x28 -> 56x56
-    Upsample2d(256, 128),
+    Upsample2d(256, 128, padding=0),
     ConvWithSkip(128),
 
-    # Block 3: 56x56 -> 112x112
+    # Block 2: 28x28 -> 56x56
     Upsample2d(128, 64),
     ConvWithSkip(64),
 
-    # Block 4: 112x112 -> 224x224
+    # Block 3: 56x56 -> 112x112
     Upsample2d(64, 32),
     ConvWithSkip(32),
 
+    # Block 4: 112x112 -> 224x224
+    Upsample2d(32, 16),
+    ConvWithSkip(16),
+
     # Final convolution to get 3 channels (RGB)
-    nn.Conv2d(32, 3, kernel_size=1),
+    nn.Conv2d(16, 3, kernel_size=1),
     nn.Sigmoid()  # Ensure output is in [0,1] range for images
 )
 
@@ -243,17 +243,11 @@ def train_decoder(args):
         pin_memory=True if device == torch.device("cuda") else False
     )
 
-    # Get a fixed batch from the *test* set for visualization
-    vis_dataloader = DataLoader(
-        test_dataset, # Use test set
-        batch_size=args.batch_size,
-        shuffle=False, # Ensure deterministic batch selection
-        num_workers=args.num_workers,
-        pin_memory=True if device == torch.device("cuda") else False
-    )
-    fixed_latents_batch, fixed_target_images_batch = next(iter(vis_dataloader))
-    fixed_latents_batch = fixed_latents_batch.to(device)
-    fixed_target_images_batch = fixed_target_images_batch.to(device)
+    # visualization data
+    fixed_latents_train, fixed_images_train = train_dataset[:args.batch_size]
+    fixed_latents_train = fixed_latents_train.to(device)
+    fixed_latents_test, fixed_images_test = test_dataset[:args.batch_size]
+    fixed_latents_test = fixed_latents_test.to(device)
 
     # Initialize Decoder model
     decoder = torch.compile(Decoder().to(device))
@@ -374,19 +368,26 @@ def train_decoder(args):
             # --- Log sample reconstructions (using EMA model) ---
             with torch.no_grad():
                 # Generate reconstructions using the fixed test batch
-                output_images_ema = eval_model(fixed_latents_batch)
+                output_images_train = eval_model(fixed_latents_train)
+                output_images_test = eval_model(fixed_latents_test)
 
             # Prepare images for logging (log first 4 images from the fixed test batch)
-            log_images = []
-            num_samples_to_log = min(4, args.batch_size, len(fixed_target_images_batch)) # Handle smaller test sets/batches
+            log_images_train = []
+            log_images_test = []
+            num_samples_to_log = min(4, args.batch_size)
             for j in range(num_samples_to_log):
-                original = fixed_target_images_batch[j].cpu().permute(1, 2, 0).numpy()
-                reconstructed = output_images_ema[j].cpu().permute(1, 2, 0).clamp(0, 1).numpy() # Clamp output just in case
-                log_images.append(wandb.Image(original, caption=f"Epoch {epoch+1} - Test Original {j}"))
-                log_images.append(wandb.Image(reconstructed, caption=f"Epoch {epoch+1} - Test Reconstructed {j}"))
+                original_train = fixed_images_train[j].cpu().permute(1, 2, 0).numpy()
+                original_test = fixed_images_test[j].cpu().permute(1, 2, 0).numpy()
+                reconstructed_train = output_images_train[j].cpu().permute(1, 2, 0).clamp(0, 1).numpy() # Clamp output just in case
+                reconstructed_test = output_images_test[j].cpu().permute(1, 2, 0).clamp(0, 1).numpy() # Clamp output just in case
+                log_images_train.append(wandb.Image(original_train, caption=f"Epoch {epoch+1} - Train Original {j}"))
+                log_images_test.append(wandb.Image(original_test, caption=f"Epoch {epoch+1} - Test Original {j}"))
+                log_images_train.append(wandb.Image(reconstructed_train, caption=f"Epoch {epoch+1} - Train Reconstructed {j}"))
+                log_images_test.append(wandb.Image(reconstructed_test, caption=f"Epoch {epoch+1} - Test Reconstructed {j}"))
 
             wandb.log({
-                f"test/sample_reconstructions": log_images,
+                "train/sample_reconstructions": log_images_train,
+                "test/sample_reconstructions": log_images_test,
                 "epoch": epoch + 1,
                 "step": global_step
             })
