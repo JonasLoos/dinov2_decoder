@@ -359,9 +359,9 @@ def train_decoder(args):
                     outputs = eval_model(latents.to(device)).cpu()
                 # plot
                 fig, axs = plt.subplots(2, len(idx), figsize=(15, 6))
-                for i in idx:
-                    axs[0, i].imshow(images[i].permute(1, 2, 0).numpy())
-                    axs[1, i].imshow(outputs[i].permute(1, 2, 0).numpy())
+                for image, output in zip(images, outputs):
+                    axs[0, i].imshow(image.permute(1, 2, 0).numpy())
+                    axs[1, i].imshow(output.permute(1, 2, 0).numpy())
                     axs[0, i].axis('off')
                     axs[1, i].axis('off')
                 plt.tight_layout()
