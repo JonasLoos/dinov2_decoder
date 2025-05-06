@@ -13,6 +13,7 @@ import wandb
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch.optim.swa_utils import AveragedModel
 import random
+import matplotlib.pyplot as plt
 
 
 # --- Reproducibility ---
@@ -243,12 +244,6 @@ def train_decoder(args):
         pin_memory=True if device == torch.device("cuda") else False
     )
 
-    # visualization data
-    fixed_latents_train, fixed_images_train = train_dataset[:args.batch_size]
-    fixed_latents_train = fixed_latents_train.to(device)
-    fixed_latents_test, fixed_images_test = test_dataset[:args.batch_size]
-    fixed_latents_test = fixed_latents_test.to(device)
-
     # Initialize Decoder model
     decoder = Decoder().to(device)
     decoder = torch.compile(decoder)
@@ -356,42 +351,36 @@ def train_decoder(args):
             avg_test_l2 = test_l2_loss / num_test_batches
             avg_test_psnr = test_psnr / num_test_batches
 
+            def visualize(dataset):
+                idx = [0, 12, 42, 80, 100]  # just some random numbers, that are smaller than the dataset length, but not directly next to each other
+                latents, images = dataset[idx]
+                # generate outputs
+                with torch.no_grad():
+                    outputs = eval_model(latents.to(device)).cpu()
+                # plot
+                fig, axs = plt.subplots(2, len(idx), figsize=(15, 6))
+                for i in idx:
+                    axs[0, i].imshow(images[i].permute(1, 2, 0).numpy())
+                    axs[1, i].imshow(outputs[i].permute(1, 2, 0).numpy())
+                    axs[0, i].axis('off')
+                    axs[1, i].axis('off')
+                plt.tight_layout()
+                # Convert matplotlib figure to PIL Image
+                fig.canvas.draw()
+                image_from_plot = Image.frombytes('RGB', fig.canvas.get_width_height(), fig.canvas.tostring_rgb())
+                plt.close(fig)
+                return image_from_plot
+
             wandb.log({
                 "test/l1_loss": avg_test_l1,
                 "test/l2_loss": avg_test_l2,
                 "test/psnr": avg_test_psnr,
-                "epoch": epoch + 1, # Log test metrics against epoch number
-                "step": global_step # Log against global step as well
+                "train/sample_reconstructions": wandb.Image(visualize(train_dataset), caption=f"Epoch {epoch+1} - Train Reconstructions"),
+                "test/sample_reconstructions": wandb.Image(visualize(test_dataset), caption=f"Epoch {epoch+1} - Test Reconstructions"),
+                "epoch": epoch + 1,
+                "step": global_step,
             })
             print(f"Epoch {epoch + 1} Test Results: L1={avg_test_l1:.4f}, L2={avg_test_l2:.4f}, PSNR={avg_test_psnr:.4f}")
-
-
-            # --- Log sample reconstructions (using EMA model) ---
-            with torch.no_grad():
-                # Generate reconstructions using the fixed test batch
-                output_images_train = eval_model(fixed_latents_train)
-                output_images_test = eval_model(fixed_latents_test)
-
-            # Prepare images for logging (log first 4 images from the fixed test batch)
-            log_images_train = []
-            log_images_test = []
-            num_samples_to_log = min(4, args.batch_size)
-            for j in range(num_samples_to_log):
-                original_train = fixed_images_train[j].cpu().permute(1, 2, 0).numpy()
-                original_test = fixed_images_test[j].cpu().permute(1, 2, 0).numpy()
-                reconstructed_train = output_images_train[j].cpu().permute(1, 2, 0).clamp(0, 1).numpy() # Clamp output just in case
-                reconstructed_test = output_images_test[j].cpu().permute(1, 2, 0).clamp(0, 1).numpy() # Clamp output just in case
-                log_images_train.append(wandb.Image(original_train, caption=f"Epoch {epoch+1} - Train Original {j}"))
-                log_images_test.append(wandb.Image(original_test, caption=f"Epoch {epoch+1} - Test Original {j}"))
-                log_images_train.append(wandb.Image(reconstructed_train, caption=f"Epoch {epoch+1} - Train Reconstructed {j}"))
-                log_images_test.append(wandb.Image(reconstructed_test, caption=f"Epoch {epoch+1} - Test Reconstructed {j}"))
-
-            wandb.log({
-                "train/sample_reconstructions": log_images_train,
-                "test/sample_reconstructions": log_images_test,
-                "epoch": epoch + 1,
-                "step": global_step
-            })
 
         print('Finished Training')
     except KeyboardInterrupt:
