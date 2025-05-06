@@ -290,7 +290,7 @@ def train_decoder(args):
                 # Calculate loss
                 l1_loss = F.l1_loss(output_images, target_images_batch)
                 l2_loss = F.mse_loss(output_images, target_images_batch)
-                loss = l1_loss + l2_loss
+                loss = args.l1_weight * l1_loss + (1 - args.l1_weight) * l2_loss
 
                 # Backward pass and optimize
                 loss.backward()
@@ -410,7 +410,7 @@ def train_decoder(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a Decoder model on DINOv2 latents.")
-    parser.add_argument("--image_dir", type=str, required=True, help="Directory containing training images.")
+    parser.add_argument("--image_dir", type=str, default='unsplash_lite_image_dataset/training_images/', help="Directory containing training images.")
     parser.add_argument("--dinov2_model", type=str, default='facebook/dinov2-base', help="DINOv2 model name from Hugging Face.")
     parser.add_argument("--cache-latents", action=argparse.BooleanOptionalAction, default=True, help="Cache DINOv2 latents (default: True). Use --no-cache-latents to disable.")
     parser.add_argument("--cache_dir", type=str, default='dinov2_latents', help="Directory to cache DINOv2 latents.")
@@ -424,6 +424,7 @@ if __name__ == "__main__":
     parser.add_argument("--ema_decay", type=float, default=0, help="Decay factor for Exponential Moving Average of model weights. Set to 0 to disable EMA.")
     parser.add_argument("--test_split_ratio", type=float, default=0.1, help="Fraction of data to use for the test set (default: 0.1).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42).")
+    parser.add_argument("--l1_weight", type=float, default=0.5, help="Weight for L1 loss in the total loss calculation (L2 weight will be 1 - l1_weight). Default: 0.5")
 
     # Wandb arguments
     parser.add_argument("--wandb_project", type=str, default="dinov2_decoder", help="Wandb project name.")
