@@ -29,5 +29,5 @@ This script will:
 ## Requirements
 
 ```bash
-pip install torch torchvision torchaudio transformers Pillow numpy tqdm requests pandas wandb matplotlib
+pip install torch torchvision torchaudio transformers Pillow numpy tqdm requests pandas wandb matplotlib torchmetrics
 ```

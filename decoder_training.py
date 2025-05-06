@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
+from torchmetrics.image.fid import FrechetInceptionDistance
 from transformers import AutoImageProcessor, AutoModel
 from PIL import Image
 from pathlib import Path
@@ -329,6 +330,8 @@ def train_decoder(args):
             test_l2_loss = 0.0
             test_psnr = 0.0
             num_test_batches = 0
+            # Initialize FID metric
+            fid = FrechetInceptionDistance(feature=64).to(device) # Using 64 features for faster computation, can be adjusted
             with torch.no_grad():
                 for latents_batch, target_images_batch in tqdm(test_dataloader, desc=f"Epoch {epoch + 1} Test Eval"):
                     latents_batch = latents_batch.to(device)
@@ -336,6 +339,15 @@ def train_decoder(args):
 
                     # Forward pass with EMA model
                     output_images_ema = eval_model(latents_batch)
+
+                    # Prepare images for FID (convert to uint8 and scale to 0-255)
+                    # FID expects NCHW format
+                    real_images_fid = (target_images_batch.clamp(0, 1) * 255).byte()
+                    fake_images_fid = (output_images_ema.clamp(0, 1) * 255).byte()
+
+                    # Update FID
+                    fid.update(real_images_fid, real=True)
+                    fid.update(fake_images_fid, real=False)
 
                     # Calculate test loss
                     batch_l1 = F.l1_loss(output_images_ema, target_images_batch)
@@ -350,6 +362,7 @@ def train_decoder(args):
             avg_test_l1 = test_l1_loss / num_test_batches
             avg_test_l2 = test_l2_loss / num_test_batches
             avg_test_psnr = test_psnr / num_test_batches
+            test_fid_score = fid.compute()
 
             def visualize(dataset):
                 idx = [0, 12, 42, 80, 100]  # just some random numbers, that are smaller than the dataset length, but not directly next to each other
@@ -371,13 +384,14 @@ def train_decoder(args):
                 "test/l1_loss": avg_test_l1,
                 "test/l2_loss": avg_test_l2,
                 "test/psnr": avg_test_psnr,
+                "test/fid": test_fid_score.item(),
                 "train/sample_reconstructions": wandb.Image(visualize(train_dataset), caption=f"Epoch {epoch+1} - Train Reconstructions"),
                 "test/sample_reconstructions": wandb.Image(visualize(test_dataset), caption=f"Epoch {epoch+1} - Test Reconstructions"),
                 "epoch": epoch + 1,
                 "step": global_step,
             })
             plt.close()
-            print(f"Epoch {epoch + 1} Test Results: L1={avg_test_l1:.4f}, L2={avg_test_l2:.4f}, PSNR={avg_test_psnr:.4f}")
+            print(f"Epoch {epoch + 1} Test Results: L1={avg_test_l1:.4f}, L2={avg_test_l2:.4f}, PSNR={avg_test_psnr:.4f}, FID={test_fid_score.item():.4f}")
 
         print('Finished Training')
     except KeyboardInterrupt:
