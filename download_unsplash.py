@@ -70,7 +70,7 @@ def load_tsv_data(data_dir: Path, docs: list) -> dict:
     datasets = {}
     logging.info("Loading TSV data...")
     for doc in docs:
-        files = list(data_dir.glob(doc + ".tsv*"))
+        files = list(data_dir.glob(doc + ".tsv*")) + list(data_dir.glob(doc + ".csv*"))
         if not files:
             logging.warning(f"No TSV files found for document type: {doc}")
             continue
@@ -152,6 +152,7 @@ def generate_training_images(raw_img_dir: Path, training_img_dir: Path, crop_siz
     training_img_dir.mkdir(exist_ok=True, parents=True)
     image_files = list(raw_img_dir.glob('*.jpg'))
     logging.info(f"Generating training images from {len(image_files)} raw images...")
+    random.seed(42)
 
     for filename in tqdm(image_files, desc="Generating training images"):
         try:

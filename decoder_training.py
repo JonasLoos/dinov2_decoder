@@ -376,6 +376,7 @@ def train_decoder(args):
                 "epoch": epoch + 1,
                 "step": global_step,
             })
+            plt.close()
             print(f"Epoch {epoch + 1} Test Results: L1={avg_test_l1:.4f}, L2={avg_test_l2:.4f}, PSNR={avg_test_psnr:.4f}")
 
         print('Finished Training')
