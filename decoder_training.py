@@ -161,7 +161,7 @@ def train_decoder(args):
 
     # List images
     print(f"Scanning for images in {args.image_dir}...")
-    all_image_paths = sorted(list(Path(args.image_dir).glob('*.jpg'))) # Sort for consistent splits
+    all_image_paths = list(Path(args.image_dir).glob('*.jpg'))
     print(f"Found {len(all_image_paths)} images.")
     if not all_image_paths:
         print("No images found. Exiting.")
